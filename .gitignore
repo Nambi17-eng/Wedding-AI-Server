@@ -1,0 +1,6 @@
+__pycache__/
+raw_photos/*
+static/*
+face_db.pkl
+*.tmp
+*.crdownload
