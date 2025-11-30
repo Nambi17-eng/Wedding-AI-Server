@@ -1,163 +1,189 @@
 import os
 import time
-import shutil
 import threading
 import pickle
 import socket
-import face_recognition
 import numpy as np
-from flask import Flask, request, render_template
+from flask import Flask, request, render_template, send_from_directory
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from PIL import Image
-from pillow_heif import register_heif_opener
-
-# Enable HEIC support (iPhone Photos)
-register_heif_opener()
+from deepface import DeepFace
+from scipy.spatial.distance import cosine
 
 # --- CONFIGURATION ---
-RAW_FOLDER = 'raw_photos'
-PROCESSED_FOLDER = 'static'
-DB_FILE = 'face_db.pkl'
-# We allow these, but we ignore DNG/RAW in logic to prevent lag
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp', 'heic', 'heif'}
+INPUT_FOLDER = 'incoming_photos'
+DB_FILE = 'database.pkl'
+
+# VGG-Face is the "AK-47" of Face Recognition. 
+# It works in bad lighting, side angles, and groups.
+MODEL_NAME = "VGG-Face" 
 
 app = Flask(__name__)
 
-# --- DATABASE MANAGEMENT ---
+# --- DATABASE SYSTEM ---
+face_database = []
+
 def load_database():
+    global face_database
     if os.path.exists(DB_FILE):
-        print("[SYSTEM] Loading existing face database...")
         try:
             with open(DB_FILE, 'rb') as f:
-                return pickle.load(f)
-        except Exception:
-            return []
-    return []
+                face_database = pickle.load(f)
+            print(f"[SYSTEM] Loaded {len(face_database)} photos from memory.")
+        except:
+            face_database = []
 
 def save_database():
     with open(DB_FILE, 'wb') as f:
         pickle.dump(face_database, f)
-    # print("[SYSTEM] Database saved.") # Commented out to reduce noise
 
-face_database = load_database()
-
-# --- STEP 1: THE AI PROCESSOR ---
-def process_new_photo(file_path):
-    global face_database
-    filename = os.path.basename(file_path)
-    
-    # 1. CRITICAL: Ignore Temp files and RAW files (Speed Protection)
-    if filename.endswith('.crdownload') or filename.endswith('.tmp') or filename.startswith('.'):
-        return
-    
-    # 2. RAW FILTER: If photographer dumps DNG/ARW, ignore them. Use JPG only.
-    if filename.lower().endswith(('.dng', '.arw', '.cr2', '.nef')):
-        print(f"[SKIPPED] RAW file ignored (Use JPG for speed): {filename}")
-        return
-
-    target_path = os.path.join(PROCESSED_FOLDER, filename)
-    
-    # Wait for file lock to release (Photographer transfer delay)
-    time.sleep(1)
-    
+# --- AI ENGINE ---
+def generate_embedding(img_path):
     try:
-        # Move file to static folder
-        shutil.move(file_path, target_path)
-        print(f"[PROCESSING] New photo detected: {filename}")
-
-        # 3. FORCE CONVERT TO RGB (Fixes WebP/PNG/HEIC issues)
-        pil_image = Image.open(target_path)
-        pil_image = pil_image.convert("RGB") 
-        image_array = np.array(pil_image)
-        
-        # Detect Faces
-        encodings = face_recognition.face_encodings(image_array)
-
-        if len(encodings) > 0:
-            for encoding in encodings:
-                face_database.append({'encoding': encoding, 'path': f"static/{filename}"})
-            save_database()
-            print(f"[SUCCESS] Found {len(encodings)} faces in {filename}")
-        else:
-            print(f"[SKIPPED] No faces found in {filename}")
-
+        # Generate Vector using VGG-Face
+        results = DeepFace.represent(
+            img_path=img_path, 
+            model_name=MODEL_NAME, 
+            enforce_detection=True, 
+            detector_backend="opencv"
+        )
+        return results
+    except ValueError:
+        return None
     except Exception as e:
-        print(f"[ERROR] Could not process {filename}: {e}")
+        print(f"[AI WARNING] Could not process {img_path}: {e}")
+        return None
 
-# --- STEP 2: FOLDER MONITORING ---
+def process_file(filename):
+    if filename.startswith('.') or filename.endswith('.tmp'): return
+    file_path = os.path.join(INPUT_FOLDER, filename)
+    time.sleep(1)
+
+    print(f"[PROCESSING] {filename}...")
+    results = generate_embedding(file_path)
+    
+    if results:
+        count = 0
+        for face in results:
+            face_database.append({
+                'path': filename,
+                'embedding': face['embedding']
+            })
+            count += 1
+        save_database()
+        print(f"[SUCCESS] Added {filename} ({count} faces found)")
+    else:
+        print(f"[SKIPPED] No face found: {filename}")
+
+# --- FOLDER MONITORING ---
 class NewPhotoHandler(FileSystemEventHandler):
     def on_created(self, event):
         if not event.is_directory:
-            threading.Thread(target=process_new_photo, args=(event.src_path,)).start()
+            filename = os.path.basename(event.src_path)
+            threading.Thread(target=process_file, args=(filename,)).start()
 
-def start_monitoring():
-    observer = Observer()
-    observer.schedule(NewPhotoHandler(), path=RAW_FOLDER, recursive=False)
-    observer.start()
-
-# --- STEP 3: THE WEB SERVER ---
+# --- WEB SERVER ---
 @app.route('/', methods=['GET', 'POST'])
 def home():
     matches = []
-    is_search = False  # Track if a search actually happened
+    is_search = False
 
     if request.method == 'POST':
         is_search = True
+        file = request.files.get('file')
         
-        if 'file' not in request.files: return "No file uploaded"
-        file = request.files['file']
-        if file.filename == '': return "No file selected"
+        if file and file.filename != '':
+            print("\n" + "="*30)
+            print("📸 NEW SELFIE UPLOADED")
+            print("="*30)
+            
+            temp_path = "temp_selfie.jpg"
+            file.save(temp_path)
+            
+            try:
+                # 1. Get Selfie Vector (Allow loose detection for selfies)
+                selfie_results = DeepFace.represent(
+                    temp_path, 
+                    model_name=MODEL_NAME, 
+                    enforce_detection=False,
+                    detector_backend="opencv"
+                )
+                
+                if selfie_results:
+                    # Check every face found in the selfie (usually just 1)
+                    for selfie_face in selfie_results:
+                        target_vector = selfie_face['embedding']
+                        
+                        # Compare against EVERY photo in DB
+                        for entry in face_database:
+                            db_vector = entry['embedding']
+                            
+                            # SCIPY CALCULATION (Accurate Math)
+                            # Lower score = Better match (0.0 is identical, 1.0 is opposite)
+                            score = cosine(target_vector, db_vector)
+                            
+                            # LOGGING: See exactly what's happening
+                            # Only print if it's somewhat close to reduce spam
+                            if score < 0.6: 
+                                print(f"Checking {entry['path']}... Score: {round(score, 3)}")
+                            
+                            # THRESHOLD FOR VGG-Face
+                            # 0.40 is the industry standard for VGG-Face
+                            if score < 0.40:
+                                print(f"✅ MATCH FOUND! ({entry['path']})")
+                                matches.append(entry['path'])
+                    
+                    matches = list(set(matches))
+                    print(f"[RESULT] Returning {len(matches)} photos.")
+                else:
+                    print("[RESULT] No faces detected in selfie.")
 
-        try:
-            # Load User Selfie & Force RGB
-            pil_image = Image.open(file)
-            pil_image = pil_image.convert("RGB")
-            selfie_image = np.array(pil_image)
+            except Exception as e:
+                print(f"Selfie Error: {e}")
             
-            selfie_encodings = face_recognition.face_encodings(selfie_image)
-            
-            if len(selfie_encodings) > 0:
-                user_face = selfie_encodings[0]
-                for entry in face_database:
-                    # Tolerance 0.5 = High Accuracy (Few false positives)
-                    # Tolerance 0.6 = Loose (More matches, potential wrong ones)
-                    match = face_recognition.compare_faces([entry['encoding']], user_face, tolerance=0.5)
-                    if match[0]: matches.append(entry['path'])
-                matches = list(set(matches))
-        except Exception as e:
-            print(f"Error processing selfie: {e}")
-            
-    return render_template('index.html', matched_photos=matches, searched=is_search)
+            if os.path.exists(temp_path): os.remove(temp_path)
 
-# --- STEP 4: AUTO-DETECT IP ADDRESS ---
-def get_ip_address():
+    return render_template('index.html', photos=matches, searched=is_search)
+
+@app.route('/photos/<path:filename>')
+def serve_hd(filename):
+    return send_from_directory(INPUT_FOLDER, filename)
+
+# --- STARTUP ---
+def get_ip():
     try:
-        # Connect to a public DNS to find our own IP on the network
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except:
-        return "127.0.0.1"
+        return s.getsockname()[0]
+    except: return "127.0.0.1"
 
 if __name__ == '__main__':
-    # Ensure folders exist
-    os.makedirs(RAW_FOLDER, exist_ok=True)
-    os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+    os.makedirs(INPUT_FOLDER, exist_ok=True)
     
-    # Start Monitoring
-    start_monitoring()
+    # Pre-load model (First run will download VGG-Face)
+    print("--------------------------------------------------")
+    print("🚀 DOWNLOADING VGG-FACE MODEL (First Run Only)...")
+    print("--------------------------------------------------")
+    try: DeepFace.build_model(MODEL_NAME)
+    except: pass
+
+    load_database()
     
-    # Get the Local Hotspot IP
-    my_ip = get_ip_address()
-    
-    print("\n" + "="*50)
-    print(f"🚀 WEDDING AI SERVER STARTED!")
-    print(f"📡 1. Turn on Mobile Hotspot on this laptop.")
-    print(f"🔗 2. YOUR URL FOR QR CODE: http://{my_ip}:5000")
-    print("="*50 + "\n")
-    
-    # Run Server
+    # Re-scan clean
+    print("[SYSTEM] Scanning existing files...")
+    # NOTE: We clear the RAM database on startup to ensure we don't have old ghosts
+    face_database = [] 
+    for f in os.listdir(INPUT_FOLDER):
+        process_file(f)
+
+    observer = Observer()
+    observer.schedule(NewPhotoHandler(), path=INPUT_FOLDER, recursive=False)
+    observer.start()
+
+    ip = get_ip()
+    print("\n" + "="*40)
+    print(f"🚀 VGG-FACE SERVER STARTED")
+    print(f"🔗 URL: http://{ip}:5000")
+    print("="*40 + "\n")
+
     app.run(host='0.0.0.0', port=5000, debug=False)

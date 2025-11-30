@@ -1,6 +1,7 @@
 __pycache__/
-raw_photos/*
-static/*
-face_db.pkl
+incoming_photos/*
+optimized_images/*
+database.pkl
 *.tmp
-*.crdownload
+*.log
+.deepface/
